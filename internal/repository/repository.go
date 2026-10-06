@@ -16,6 +16,7 @@ type Repository struct {
 	seals        map[string]domain.EvidenceSeal
 	events       []domain.AuditEvent
 	counters     map[string]int
+	idempotency  map[string]IdempotencyRecord
 }
 
 func New() *Repository {
@@ -25,7 +26,17 @@ func New() *Repository {
 		measurements: make(map[string][]domain.Measurement),
 		seals:        make(map[string]domain.EvidenceSeal),
 		counters:     make(map[string]int),
+		idempotency:  make(map[string]IdempotencyRecord),
 	}
+}
+
+// IdempotencyRecord is the committed outcome of one identified business
+// submission. The payload is the JSON-encoded result produced by the first
+// successful execution, replayed verbatim to later retries of the same key.
+type IdempotencyRecord struct {
+	Key         string
+	Fingerprint string
+	Payload     []byte
 }
 
 type Snapshot struct {
@@ -97,6 +108,7 @@ type Mutation struct {
 	seals        map[string]domain.EvidenceSeal
 	events       []domain.AuditEvent
 	counters     map[string]int
+	idempotency  map[string]IdempotencyRecord
 }
 
 func (m *Mutation) NextID(prefix string) string {
@@ -193,6 +205,19 @@ func (m *Mutation) AppendEvent(item domain.AuditEvent) {
 	m.events = append(m.events, item)
 }
 
+func (m *Mutation) IdempotencyRecord(key string) (IdempotencyRecord, bool) {
+	record, ok := m.idempotency[key]
+	return record, ok
+}
+
+func (m *Mutation) PutIdempotencyRecord(record IdempotencyRecord) error {
+	if _, exists := m.idempotency[record.Key]; exists {
+		return fmt.Errorf("%w: idempotency key %s", domain.ErrIdempotencyConflict, record.Key)
+	}
+	m.idempotency[record.Key] = record
+	return nil
+}
+
 func (m *Mutation) Events(caseID string) []domain.AuditEvent {
 	var result []domain.AuditEvent
 	for _, item := range m.events {
@@ -226,6 +251,7 @@ func (r *Repository) Mutate(ctx context.Context, fn func(*Mutation) error) error
 		seals:        cloneSeals(r.seals),
 		events:       append([]domain.AuditEvent(nil), r.events...),
 		counters:     cloneCounters(r.counters),
+		idempotency:  cloneIdempotencyRecords(r.idempotency),
 	}
 	if err := fn(next); err != nil {
 		return err
@@ -236,6 +262,7 @@ func (r *Repository) Mutate(ctx context.Context, fn func(*Mutation) error) error
 	r.seals = next.seals
 	r.events = next.events
 	r.counters = next.counters
+	r.idempotency = next.idempotency
 	return nil
 }
 
@@ -283,6 +310,14 @@ func cloneSeals(values map[string]domain.EvidenceSeal) map[string]domain.Evidenc
 
 func cloneCounters(values map[string]int) map[string]int {
 	result := make(map[string]int, len(values))
+	for key, value := range values {
+		result[key] = value
+	}
+	return result
+}
+
+func cloneIdempotencyRecords(values map[string]IdempotencyRecord) map[string]IdempotencyRecord {
+	result := make(map[string]IdempotencyRecord, len(values))
 	for key, value := range values {
 		result[key] = value
 	}

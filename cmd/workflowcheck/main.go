@@ -40,6 +40,7 @@ func main() {
 		"record-measurement":       checkRecordMeasurement,
 		"reopen-verification-case": checkReopenVerificationCase,
 		"seal-verification":        checkSealVerification,
+		"idempotent-retry":         checkIdempotentRetry,
 	}
 	run, ok := checks[*workflow]
 	if !ok {
@@ -375,6 +376,320 @@ func checkSealVerification() error {
 	return nil
 }
 
+func checkIdempotentRetry() error {
+	h := newHarness()
+	defer h.close()
+
+	// Register device: a retry with the same key and content replays the first
+	// result instead of registering again.
+	registerBody := map[string]any{
+		"asset_tag": "MET-2001",
+		"model":     "Bench Meter",
+		"room":      "Room A",
+		"steward":   "Lin",
+	}
+	first, err := h.requestWithKey(http.MethodPost, "/devices", registerBody, "retry-register-1")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(first, http.StatusCreated); err != nil {
+		return err
+	}
+	deviceID, err := nestedString(first.Body, "device", "id")
+	if err != nil {
+		return err
+	}
+	replay, err := h.requestWithKey(http.MethodPost, "/devices", registerBody, "retry-register-1")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(replay, http.StatusCreated); err != nil {
+		return err
+	}
+	if replay.Raw != first.Raw {
+		return fmt.Errorf("replayed register response differs:\nfirst:  %s\nreplay: %s", first.Raw, replay.Raw)
+	}
+	duplicate, err := h.requestWithKey(http.MethodPost, "/devices", registerBody, "retry-register-2")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(duplicate, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(duplicate, "duplicate_asset_tag"); err != nil {
+		return fmt.Errorf("retry created a second device: %w", err)
+	}
+
+	// The same key with different content is rejected, and stays rejected.
+	changedBody := map[string]any{
+		"asset_tag": "MET-2001",
+		"model":     "Other Meter",
+		"room":      "Room B",
+		"steward":   "Mira",
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		conflict, err := h.requestWithKey(http.MethodPost, "/devices", changedBody, "retry-register-1")
+		if err != nil {
+			return err
+		}
+		if err := expectStatus(conflict, http.StatusConflict); err != nil {
+			return err
+		}
+		if err := expectErrorCode(conflict, "idempotency_conflict"); err != nil {
+			return err
+		}
+	}
+
+	// A request that failed before taking effect is not remembered: the same
+	// key may be reused with corrected content.
+	invalidBody := map[string]any{
+		"asset_tag": "MET-2002",
+		"model":     "",
+		"room":      "Room A",
+		"steward":   "Lin",
+	}
+	failed, err := h.requestWithKey(http.MethodPost, "/devices", invalidBody, "retry-register-3")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(failed, http.StatusBadRequest); err != nil {
+		return err
+	}
+	recoveredBody := map[string]any{
+		"asset_tag": "MET-2002",
+		"model":     "Bench Meter",
+		"room":      "Room A",
+		"steward":   "Lin",
+	}
+	recovered, err := h.requestWithKey(http.MethodPost, "/devices", recoveredBody, "retry-register-3")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(recovered, http.StatusCreated); err != nil {
+		return err
+	}
+	recoveredReplay, err := h.requestWithKey(http.MethodPost, "/devices", recoveredBody, "retry-register-3")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(recoveredReplay, http.StatusCreated); err != nil {
+		return err
+	}
+	if recoveredReplay.Raw != recovered.Raw {
+		return fmt.Errorf("recovered register replay differs:\nfirst:  %s\nreplay: %s", recovered.Raw, recoveredReplay.Raw)
+	}
+
+	// Concurrent open-case retries with one key commit exactly one case.
+	caseBody := map[string]any{
+		"device_id": deviceID,
+		"nominal":   25.0,
+		"tolerance": 0.5,
+		"steward":   "Qiao",
+	}
+	opened, err := h.concurrent(3, func() (apiResponse, error) {
+		return h.requestWithKey(http.MethodPost, "/cases", caseBody, "retry-case-1")
+	})
+	if err != nil {
+		return err
+	}
+	caseID := ""
+	for index, response := range opened {
+		if err := expectStatus(response, http.StatusCreated); err != nil {
+			return fmt.Errorf("concurrent open %d: %w", index, err)
+		}
+		id, err := nestedString(response.Body, "case", "id")
+		if err != nil {
+			return err
+		}
+		if caseID == "" {
+			caseID = id
+		} else if id != caseID {
+			return fmt.Errorf("concurrent opens committed cases %q and %q", caseID, id)
+		}
+	}
+	secondCase, err := h.requestWithKey(http.MethodPost, "/cases", caseBody, "retry-case-2")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(secondCase, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(secondCase, "active_case_exists"); err != nil {
+		return fmt.Errorf("concurrent retries committed more than one case: %w", err)
+	}
+
+	// Measurement replay returns the recorded outcome instead of a state
+	// conflict, and appends no further measurement.
+	measurementBody := map[string]any{
+		"observed":   25.2,
+		"technician": "Rui",
+	}
+	measured, err := h.requestWithKey(http.MethodPost, "/cases/"+caseID+"/measurements", measurementBody, "retry-measure-1")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(measured, http.StatusCreated); err != nil {
+		return err
+	}
+	measuredReplay, err := h.requestWithKey(http.MethodPost, "/cases/"+caseID+"/measurements", measurementBody, "retry-measure-1")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(measuredReplay, http.StatusCreated); err != nil {
+		return err
+	}
+	if measuredReplay.Raw != measured.Raw {
+		return fmt.Errorf("replayed measurement response differs:\nfirst:  %s\nreplay: %s", measured.Raw, measuredReplay.Raw)
+	}
+	plainRetry, err := h.request(http.MethodPost, "/cases/"+caseID+"/measurements", measurementBody)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(plainRetry, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(plainRetry, "state_conflict"); err != nil {
+		return fmt.Errorf("request without key lost the original semantics: %w", err)
+	}
+	caseView, err := h.request(http.MethodGet, "/cases/"+caseID, nil)
+	if err != nil {
+		return err
+	}
+	measurements, err := nestedSlice(caseView.Body, "measurements")
+	if err != nil {
+		return err
+	}
+	if len(measurements) != 1 {
+		return fmt.Errorf("measurement replay appended entries: %d measurements", len(measurements))
+	}
+
+	// Reopen replay returns the recorded outcome and adds no extra audit event.
+	rejectedCaseID, err := h.rejectedCase("MET-2003")
+	if err != nil {
+		return err
+	}
+	reopenBody := map[string]any{
+		"actor":  "Lin",
+		"reason": "measurement setup was replaced",
+	}
+	reopened, err := h.requestWithKey(http.MethodPost, "/cases/"+rejectedCaseID+"/reopen", reopenBody, "retry-reopen-1")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(reopened, http.StatusOK); err != nil {
+		return err
+	}
+	reopenedReplay, err := h.requestWithKey(http.MethodPost, "/cases/"+rejectedCaseID+"/reopen", reopenBody, "retry-reopen-1")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(reopenedReplay, http.StatusOK); err != nil {
+		return err
+	}
+	if reopenedReplay.Raw != reopened.Raw {
+		return fmt.Errorf("replayed reopen response differs:\nfirst:  %s\nreplay: %s", reopened.Raw, reopenedReplay.Raw)
+	}
+	reopenEvents, err := h.request(http.MethodGet, "/cases/"+rejectedCaseID+"/events", nil)
+	if err != nil {
+		return err
+	}
+	if count := countEvents(reopenEvents.Body, "case_reopened"); count != 1 {
+		return fmt.Errorf("reopen replay appended audit events: %d case_reopened events", count)
+	}
+
+	// Concurrent seal retries with one key commit exactly one evidence seal.
+	sealBody := map[string]any{
+		"reviewer": "Wei",
+		"summary":  "accepted measurement sealed for review",
+	}
+	sealed, err := h.concurrent(2, func() (apiResponse, error) {
+		return h.requestWithKey(http.MethodPost, "/cases/"+caseID+"/seal", sealBody, "retry-seal-1")
+	})
+	if err != nil {
+		return err
+	}
+	sealID := ""
+	for index, response := range sealed {
+		if err := expectStatus(response, http.StatusCreated); err != nil {
+			return fmt.Errorf("concurrent seal %d: %w", index, err)
+		}
+		id, err := nestedString(response.Body, "seal", "id")
+		if err != nil {
+			return err
+		}
+		if sealID == "" {
+			sealID = id
+		} else if id != sealID {
+			return fmt.Errorf("concurrent seals committed seals %q and %q", sealID, id)
+		}
+	}
+	sealedAgain, err := h.requestWithKey(http.MethodPost, "/cases/"+caseID+"/seal", sealBody, "retry-seal-2")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(sealedAgain, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(sealedAgain, "seal_exists"); err != nil {
+		return fmt.Errorf("concurrent retries committed more than one seal: %w", err)
+	}
+
+	// A key is bound to one business intent across all write endpoints.
+	crossOperation, err := h.requestWithKey(http.MethodPost, "/cases", caseBody, "retry-register-1")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(crossOperation, http.StatusConflict); err != nil {
+		return err
+	}
+	return expectErrorCode(crossOperation, "idempotency_conflict")
+}
+
+func (h *harness) concurrent(count int, call func() (apiResponse, error)) ([]apiResponse, error) {
+	type outcome struct {
+		response apiResponse
+		err      error
+	}
+	results := make(chan outcome, count)
+	var wait sync.WaitGroup
+	for index := 0; index < count; index++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			response, err := call()
+			results <- outcome{response: response, err: err}
+		}()
+	}
+	wait.Wait()
+	close(results)
+	responses := make([]apiResponse, 0, count)
+	for item := range results {
+		if item.err != nil {
+			return nil, item.err
+		}
+		responses = append(responses, item.response)
+	}
+	return responses, nil
+}
+
+func countEvents(root map[string]any, kind string) int {
+	items, err := nestedSlice(root, "events")
+	if err != nil {
+		return 0
+	}
+	count := 0
+	for _, item := range items {
+		event, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if event["kind"] == kind {
+			count++
+		}
+	}
+	return count
+}
+
 func newHarness() *harness {
 	server := httptest.NewServer(bootstrap.NewHandler())
 	return &harness{
@@ -389,6 +704,10 @@ func (h *harness) close() {
 }
 
 func (h *harness) request(method, path string, body any) (apiResponse, error) {
+	return h.requestWithKey(method, path, body, "")
+}
+
+func (h *harness) requestWithKey(method, path string, body any, idempotencyKey string) (apiResponse, error) {
 	var reader io.Reader
 	if body != nil {
 		encoded, err := json.Marshal(body)
@@ -405,6 +724,9 @@ func (h *harness) request(method, path string, body any) (apiResponse, error) {
 	}
 	if body != nil {
 		request.Header.Set("Content-Type", "application/json")
+	}
+	if idempotencyKey != "" {
+		request.Header.Set("Idempotency-Key", idempotencyKey)
 	}
 	response, err := h.client.Do(request)
 	if err != nil {

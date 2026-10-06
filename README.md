@@ -22,6 +22,7 @@ go run ./cmd/workflowcheck --workflow open-verification-case
 go run ./cmd/workflowcheck --workflow record-measurement
 go run ./cmd/workflowcheck --workflow reopen-verification-case
 go run ./cmd/workflowcheck --workflow seal-verification
+go run ./cmd/workflowcheck --workflow idempotent-retry
 ```
 
 The workflow runner starts a fresh in-process HTTP service and exercises the
@@ -42,6 +43,24 @@ or extend these smoke checks with red/green verification tests.
 - `POST /cases/{id}/reopen`
 - `POST /cases/{id}/seal`
 - `GET /cases/{id}/events`
+
+## Idempotent Retry
+
+Every `POST` endpoint accepts an optional `Idempotency-Key` header carrying a
+stable caller-chosen identifier for one business submission. When a request
+with the header succeeds, the service records the outcome under the key in the
+same atomic commit as the business change:
+
+- A retry with the same key and the same content replays the recorded response
+  instead of executing again, so a lost response never creates a duplicate
+  device, case, measurement, reopen, or seal.
+- A request with the same key but different content is rejected with
+  `409 idempotency_conflict`, and stays rejected.
+- A request that failed before taking effect records nothing, so its key may be
+  reused with corrected content.
+- Concurrent retries with one key commit exactly one business fact.
+
+Requests without the header keep the original at-least-once semantics.
 
 ## Layout
 

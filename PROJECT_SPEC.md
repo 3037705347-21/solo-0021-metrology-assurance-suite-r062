@@ -91,6 +91,24 @@ Required invariants:
 - Every mutation that changes a case also appends an audit event in the same
   repository commit.
 
+## Idempotent Submission
+
+Callers may attach a stable retry identifier to any write request with the
+`Idempotency-Key` header. The identifier scopes one business submission across
+retries after network jitter or client timeouts:
+
+- The first successful execution records its response under the key in the
+  same repository commit as the business change.
+- A retry with the same key and the same content replays the recorded
+  response; it does not execute the workflow again.
+- A retry with the same key but different content is rejected with
+  `idempotency_conflict`, and the rejection is stable for the key.
+- A failed execution records nothing, so the key stays usable for a corrected
+  submission.
+- The lookup, execution, and recording share one repository mutation lock, so
+  concurrent retries with one key commit exactly one business fact.
+- Requests without the header keep the original semantics.
+
 ## Modules
 
 - `cmd/metrology-service`: process entrypoint and graceful HTTP shutdown.
@@ -121,7 +139,10 @@ bounded production smoke command under `cmd/workflowcheck`. The command starts
 an HTTP test server in the same process, calls the public routes, and verifies
 both success and failure behavior. The seal check also races two concurrent
 seal requests to prove that the repository mutation lock permits exactly one
-seal.
+seal. The idempotent-retry check verifies that identified retries replay the
+first recorded result, that reused keys with different content are stably
+rejected, that failed requests are not remembered, and that concurrent retries
+with one key commit exactly one business fact.
 
 Tests are intentionally deferred for this initialization baseline. The later
 engineering-task stage will add unit and integration tests, including red/green
