@@ -90,6 +90,18 @@ Required invariants:
 - A sealed case cannot accept measurements, reopen, or seal again.
 - Every mutation that changes a case also appends an audit event in the same
   repository commit.
+- A mutating request may carry a stable retry identifier (`Idempotency-Key`)
+  scoped to the route and path. The first successful submission for a key is
+  stored with a canonical fingerprint of its content and its readable result.
+- Retries carrying the same key and content replay the first stored result
+  (with `Idempotency-Replayed: true`) and never create a second business fact.
+- A key reused with different content is rejected stably with
+  `idempotency_conflict`. A request that fails before taking effect stores no
+  record, so it can be retried. Concurrent retries resolve to one committed
+  business fact because the record is written in the same serialized
+  repository commit as the business change.
+- Requests without a retry identifier retain the original non-idempotent
+  semantics.
 
 ## Modules
 
@@ -121,7 +133,11 @@ bounded production smoke command under `cmd/workflowcheck`. The command starts
 an HTTP test server in the same process, calls the public routes, and verifies
 both success and failure behavior. The seal check also races two concurrent
 seal requests to prove that the repository mutation lock permits exactly one
-seal.
+seal. The idempotent-retry check verifies replay of the first stored result,
+stable rejection of a reused key with different content, that failed attempts
+are not remembered, scope isolation per route/path, keyless backward
+compatibility, and that concurrent keyed retries produce exactly one business
+fact plus replays.
 
 Tests are intentionally deferred for this initialization baseline. The later
 engineering-task stage will add unit and integration tests, including red/green

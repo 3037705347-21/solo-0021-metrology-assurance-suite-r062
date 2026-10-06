@@ -3,6 +3,7 @@ package httpapi
 import (
 	"net/http"
 
+	"example.com/solo-0021-metrology-assurance-suite/internal/assurance"
 	"example.com/solo-0021-metrology-assurance-suite/internal/contracts"
 )
 
@@ -16,12 +17,21 @@ func (s *Server) registerDevice(writer http.ResponseWriter, request *http.Reques
 		writeError(writer, err)
 		return
 	}
-	device, err := s.service.RegisterDevice(request.Context(), input)
+	retry, err := retryIdentity(request, input)
 	if err != nil {
 		writeError(writer, err)
 		return
 	}
-	writeJSON(writer, http.StatusCreated, contracts.DeviceResponse{Device: device})
+	outcome, err := s.service.RegisterDevice(request.Context(), input, retry)
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	writeSubmission(writer, assurance.Submission[contracts.DeviceResponse]{
+		Value:    contracts.DeviceResponse{Device: outcome.Value},
+		Status:   outcome.Status,
+		Replayed: outcome.Replayed,
+	})
 }
 
 func (s *Server) device(writer http.ResponseWriter, request *http.Request) {
@@ -39,12 +49,17 @@ func (s *Server) openCase(writer http.ResponseWriter, request *http.Request) {
 		writeError(writer, err)
 		return
 	}
-	view, err := s.service.OpenCase(request.Context(), input)
+	retry, err := retryIdentity(request, input)
 	if err != nil {
 		writeError(writer, err)
 		return
 	}
-	writeJSON(writer, http.StatusCreated, view)
+	outcome, err := s.service.OpenCase(request.Context(), input, retry)
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	writeSubmission(writer, outcome)
 }
 
 func (s *Server) caseView(writer http.ResponseWriter, request *http.Request) {
@@ -62,12 +77,17 @@ func (s *Server) recordMeasurement(writer http.ResponseWriter, request *http.Req
 		writeError(writer, err)
 		return
 	}
-	view, err := s.service.RecordMeasurement(request.Context(), request.PathValue("id"), input)
+	retry, err := retryIdentity(request, input)
 	if err != nil {
 		writeError(writer, err)
 		return
 	}
-	writeJSON(writer, http.StatusCreated, view)
+	outcome, err := s.service.RecordMeasurement(request.Context(), request.PathValue("id"), input, retry)
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	writeSubmission(writer, outcome)
 }
 
 func (s *Server) reopenCase(writer http.ResponseWriter, request *http.Request) {
@@ -76,12 +96,17 @@ func (s *Server) reopenCase(writer http.ResponseWriter, request *http.Request) {
 		writeError(writer, err)
 		return
 	}
-	view, err := s.service.ReopenCase(request.Context(), request.PathValue("id"), input)
+	retry, err := retryIdentity(request, input)
 	if err != nil {
 		writeError(writer, err)
 		return
 	}
-	writeJSON(writer, http.StatusOK, view)
+	outcome, err := s.service.ReopenCase(request.Context(), request.PathValue("id"), input, retry)
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	writeSubmission(writer, outcome)
 }
 
 func (s *Server) sealCase(writer http.ResponseWriter, request *http.Request) {
@@ -90,12 +115,17 @@ func (s *Server) sealCase(writer http.ResponseWriter, request *http.Request) {
 		writeError(writer, err)
 		return
 	}
-	view, err := s.service.SealCase(request.Context(), request.PathValue("id"), input)
+	retry, err := retryIdentity(request, input)
 	if err != nil {
 		writeError(writer, err)
 		return
 	}
-	writeJSON(writer, http.StatusCreated, view)
+	outcome, err := s.service.SealCase(request.Context(), request.PathValue("id"), input, retry)
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	writeSubmission(writer, outcome)
 }
 
 func (s *Server) events(writer http.ResponseWriter, request *http.Request) {

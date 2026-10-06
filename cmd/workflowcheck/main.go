@@ -16,12 +16,14 @@ import (
 	"time"
 
 	"example.com/solo-0021-metrology-assurance-suite/internal/bootstrap"
+	"example.com/solo-0021-metrology-assurance-suite/internal/httpapi"
 )
 
 type apiResponse struct {
-	Status int
-	Body   map[string]any
-	Raw    string
+	Status   int
+	Body     map[string]any
+	Raw      string
+	Replayed bool
 }
 
 type harness struct {
@@ -40,6 +42,7 @@ func main() {
 		"record-measurement":       checkRecordMeasurement,
 		"reopen-verification-case": checkReopenVerificationCase,
 		"seal-verification":        checkSealVerification,
+		"idempotent-retry":         checkIdempotentRetry,
 	}
 	run, ok := checks[*workflow]
 	if !ok {
@@ -375,6 +378,377 @@ func checkSealVerification() error {
 	return nil
 }
 
+func checkIdempotentRetry() error {
+	h := newHarness()
+	defer h.close()
+
+	registerBody := map[string]any{
+		"asset_tag": "met-1501",
+		"model":     "Bench Meter",
+		"room":      "Room A",
+		"steward":   "Lin",
+	}
+
+	// 1. First keyed submission creates exactly one device.
+	first, err := h.idempotent(http.MethodPost, "/devices", "dev-key-1", registerBody)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(first, http.StatusCreated); err != nil {
+		return err
+	}
+	if first.Replayed {
+		return errors.New("first keyed submission was marked as replay")
+	}
+	deviceID, err := nestedString(first.Body, "device", "id")
+	if err != nil {
+		return err
+	}
+
+	// 2. Same key, same logical intent replays the stored result: same status,
+	// same id, and an explicit replay marker. No second device is created.
+	retry, err := h.idempotent(http.MethodPost, "/devices", "dev-key-1", registerBody)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(retry, http.StatusCreated); err != nil {
+		return err
+	}
+	if !retry.Replayed {
+		return errors.New("identical retry was not served from the stored result")
+	}
+	retryID, err := nestedString(retry.Body, "device", "id")
+	if err != nil {
+		return err
+	}
+	if retryID != deviceID {
+		return fmt.Errorf("replay returned device %q, expected first result %q", retryID, deviceID)
+	}
+
+	// 3. Wire-format differences (field order, whitespace) keep the same
+	// canonical fingerprint and must still replay instead of being rejected.
+	reshuffled, err := h.requestWith(http.MethodPost, "/devices", []byte(
+		`{ "steward":"Lin" , "room":"Room A","model":"Bench Meter","asset_tag":"met-1501" }`,
+	), map[string]string{httpapi.IdempotencyKeyHeader: "dev-key-1"})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(reshuffled, http.StatusCreated); err != nil {
+		return err
+	}
+	if !reshuffled.Replayed {
+		return errors.New("byte-different but content-equal retry was not replayed")
+	}
+
+	// 4. Same key reused with genuinely different content is a stable conflict.
+	conflict, err := h.idempotent(http.MethodPost, "/devices", "dev-key-1", map[string]any{
+		"asset_tag": "met-1501",
+		"model":     "Bench Meter",
+		"room":      "Room A",
+		"steward":   "Mira",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(conflict, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(conflict, "idempotency_conflict"); err != nil {
+		return err
+	}
+
+	// 5. A key is scoped to the route: the same key on POST /cases starts a
+	// fresh business submission instead of replaying the device result.
+	caseBody := map[string]any{
+		"device_id": deviceID,
+		"nominal":   25.0,
+		"tolerance": 0.5,
+		"steward":   "Qiao",
+	}
+	opened, err := h.idempotent(http.MethodPost, "/cases", "dev-key-1", caseBody)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(opened, http.StatusCreated); err != nil {
+		return err
+	}
+	if opened.Replayed {
+		return errors.New("key reused in a different scope was incorrectly replayed")
+	}
+	caseID, err := nestedString(opened.Body, "case", "id")
+	if err != nil {
+		return err
+	}
+
+	// 6. Retrying the case open replays the first case rather than failing with
+	// active_case_exists, which is what a naive resend would produce.
+	openedRetry, err := h.idempotent(http.MethodPost, "/cases", "dev-key-1", caseBody)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(openedRetry, http.StatusCreated); err != nil {
+		return err
+	}
+	if !openedRetry.Replayed {
+		return errors.New("open-case retry was not replayed")
+	}
+	openedRetryID, err := nestedString(openedRetry.Body, "case", "id")
+	if err != nil {
+		return err
+	}
+	if openedRetryID != caseID {
+		return fmt.Errorf("open-case replay returned %q, expected %q", openedRetryID, caseID)
+	}
+
+	// 7. A failed attempt must not be remembered: open a case for a missing
+	// device under a new key, then retry the same key with valid content.
+	missing, err := h.idempotent(http.MethodPost, "/cases", "case-key-missing", map[string]any{
+		"device_id": "device-9999",
+		"nominal":   25.0,
+		"tolerance": 0.5,
+		"steward":   "Qiao",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(missing, http.StatusNotFound); err != nil {
+		return err
+	}
+	secondDeviceID, err := h.createDevice("MET-1502")
+	if err != nil {
+		return err
+	}
+	recovered, err := h.idempotent(http.MethodPost, "/cases", "case-key-missing", map[string]any{
+		"device_id": secondDeviceID,
+		"nominal":   25.0,
+		"tolerance": 0.5,
+		"steward":   "Qiao",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(recovered, http.StatusCreated); err != nil {
+		return fmt.Errorf("retry after a failed attempt was remembered: %v", err)
+	}
+	if recovered.Replayed {
+		return errors.New("failed attempt produced a replay marker")
+	}
+	secondCaseID, err := nestedString(recovered.Body, "case", "id")
+	if err != nil {
+		return err
+	}
+
+	// 8. Recording a measurement once under a key, then replaying, must leave
+	// exactly one measurement and keep review_ready; a keyless resend still
+	// hits the normal terminal-state conflict.
+	measurementBody := map[string]any{"observed": 25.2, "technician": "Rui"}
+	measured, err := h.idempotent(http.MethodPost, "/cases/"+caseID+"/measurements", "measure-key-1", measurementBody)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(measured, http.StatusCreated); err != nil {
+		return err
+	}
+	measuredRetry, err := h.idempotent(http.MethodPost, "/cases/"+caseID+"/measurements", "measure-key-1", measurementBody)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(measuredRetry, http.StatusCreated); err != nil {
+		return err
+	}
+	if !measuredRetry.Replayed {
+		return errors.New("measurement retry was not replayed")
+	}
+	measurements, err := nestedSlice(measuredRetry.Body, "measurements")
+	if err != nil {
+		return err
+	}
+	if len(measurements) != 1 {
+		return fmt.Errorf("measurement replay created %d facts, expected 1", len(measurements))
+	}
+	keyless, err := h.recordMeasurement(caseID, 25.2, "Rui")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(keyless, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(keyless, "state_conflict"); err != nil {
+		return err
+	}
+
+	// 9. A key on one case cannot be replayed against another case, even with
+	// the same body, because the routed path is part of the scope.
+	crossScope, err := h.idempotent(http.MethodPost, "/cases/"+secondCaseID+"/measurements", "measure-key-1", map[string]any{
+		"observed":   25.0,
+		"technician": "Rui",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(crossScope, http.StatusCreated); err != nil {
+		return fmt.Errorf("same key on a different case did not start a new submission: %s", crossScope.Raw)
+	}
+
+	// 10. Reopen is idempotent as well. Drive a fresh case to
+	// recheck_required, reopen it once under a key, and replay the retry.
+	reopenDeviceID, err := h.createDevice("MET-1504")
+	if err != nil {
+		return err
+	}
+	reopenOpened, err := h.openCase(reopenDeviceID)
+	if err != nil {
+		return err
+	}
+	reopenCaseID, err := nestedString(reopenOpened.Body, "case", "id")
+	if err != nil {
+		return err
+	}
+	outOfTolerance, err := h.recordMeasurement(reopenCaseID, 26.5, "Rui")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(outOfTolerance, http.StatusCreated); err != nil {
+		return err
+	}
+	reopenBody := map[string]any{
+		"actor":  "Lin",
+		"reason": "measurement setup was replaced",
+	}
+	reopened, err := h.idempotent(http.MethodPost, "/cases/"+reopenCaseID+"/reopen", "reopen-key-1", reopenBody)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(reopened, http.StatusOK); err != nil {
+		return err
+	}
+	if reopened.Replayed {
+		return errors.New("first keyed reopen was marked as replay")
+	}
+	reopenRetry, err := h.idempotent(http.MethodPost, "/cases/"+reopenCaseID+"/reopen", "reopen-key-1", reopenBody)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(reopenRetry, http.StatusOK); err != nil {
+		return err
+	}
+	if !reopenRetry.Replayed {
+		return errors.New("reopen retry was not replayed")
+	}
+	reopenState, err := nestedString(reopenRetry.Body, "case", "state")
+	if err != nil {
+		return err
+	}
+	if reopenState != "awaiting_measurement" {
+		return fmt.Errorf("replayed reopen state = %q", reopenState)
+	}
+	eventsView, err := h.request(http.MethodGet, "/cases/"+reopenCaseID+"/events", nil)
+	if err != nil {
+		return err
+	}
+	reopenEvents, err := nestedSlice(eventsView.Body, "events")
+	if err != nil {
+		return err
+	}
+	if countEvents(reopenEvents, "case_reopened") != 1 {
+		return fmt.Errorf("reopen replay created %d reopen facts, expected 1", countEvents(reopenEvents, "case_reopened"))
+	}
+	// Same key, different reason is an idempotency conflict rather than a
+	// second reopen or a plain state conflict.
+	reopenConflict, err := h.idempotent(http.MethodPost, "/cases/"+reopenCaseID+"/reopen", "reopen-key-1", map[string]any{
+		"actor":  "Lin",
+		"reason": "different reason on retry",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(reopenConflict, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(reopenConflict, "idempotency_conflict"); err != nil {
+		return err
+	}
+
+	// 11. A blank key opts out and preserves the original non-idempotent path.
+	blankKey, err := h.requestWith(http.MethodPost, "/devices", []byte(
+		`{"asset_tag":"met-1503","model":"Bench Meter","room":"Room A","steward":"Lin"}`,
+	), map[string]string{httpapi.IdempotencyKeyHeader: "   "})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(blankKey, http.StatusCreated); err != nil {
+		return err
+	}
+	if blankKey.Replayed {
+		return errors.New("blank idempotency key unexpectedly produced a replay")
+	}
+
+	// 12. An oversized key is rejected before any business action runs.
+	longKey := strings.Repeat("k", 201)
+	oversized, err := h.idempotent(http.MethodPost, "/devices", longKey, registerBody)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(oversized, http.StatusBadRequest); err != nil {
+		return err
+	}
+
+	// 13. Concurrent retries with the same key and content produce exactly one
+	// business fact: one created seal plus one replay of that seal.
+	type outcome struct {
+		response apiResponse
+		err      error
+	}
+	results := make(chan outcome, 2)
+	var wait sync.WaitGroup
+	sealBody := map[string]any{
+		"reviewer": "Reviewer",
+		"summary":  "accepted measurement sealed for review",
+	}
+	for range 2 {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			response, reqErr := h.idempotent(http.MethodPost, "/cases/"+caseID+"/seal", "seal-key-1", sealBody)
+			results <- outcome{response: response, err: reqErr}
+		}()
+	}
+	wait.Wait()
+	close(results)
+
+	created := 0
+	replayedSeals := 0
+	for item := range results {
+		if item.err != nil {
+			return item.err
+		}
+		if item.response.Status != http.StatusCreated {
+			return fmt.Errorf("concurrent keyed seal returned %d: %s", item.response.Status, item.response.Raw)
+		}
+		if item.response.Replayed {
+			replayedSeals++
+		} else {
+			created++
+		}
+	}
+	if created != 1 || replayedSeals != 1 {
+		return fmt.Errorf("concurrent keyed seal produced %d created and %d replays", created, replayedSeals)
+	}
+
+	read, err := h.request(http.MethodGet, "/cases/"+caseID, nil)
+	if err != nil {
+		return err
+	}
+	state, err := nestedString(read.Body, "case", "state")
+	if err != nil {
+		return err
+	}
+	if state != "sealed" {
+		return fmt.Errorf("sealed case state = %q", state)
+	}
+	return nil
+}
+
 func newHarness() *harness {
 	server := httptest.NewServer(bootstrap.NewHandler())
 	return &harness{
@@ -389,13 +763,23 @@ func (h *harness) close() {
 }
 
 func (h *harness) request(method, path string, body any) (apiResponse, error) {
+	if body == nil {
+		return h.requestWith(method, path, nil, nil)
+	}
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		return apiResponse{}, err
+	}
+	return h.requestWith(method, path, encoded, nil)
+}
+
+// requestWith sends a raw JSON body with extra headers. It is used to carry
+// Idempotency-Key values and to prove that wire-format differences (field
+// order, whitespace) do not change the canonical request fingerprint.
+func (h *harness) requestWith(method, path string, rawBody []byte, headers map[string]string) (apiResponse, error) {
 	var reader io.Reader
-	if body != nil {
-		encoded, err := json.Marshal(body)
-		if err != nil {
-			return apiResponse{}, err
-		}
-		reader = bytes.NewReader(encoded)
+	if rawBody != nil {
+		reader = bytes.NewReader(rawBody)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -403,8 +787,11 @@ func (h *harness) request(method, path string, body any) (apiResponse, error) {
 	if err != nil {
 		return apiResponse{}, err
 	}
-	if body != nil {
+	if rawBody != nil {
 		request.Header.Set("Content-Type", "application/json")
+	}
+	for name, value := range headers {
+		request.Header.Set(name, value)
 	}
 	response, err := h.client.Do(request)
 	if err != nil {
@@ -415,13 +802,28 @@ func (h *harness) request(method, path string, body any) (apiResponse, error) {
 	if err != nil {
 		return apiResponse{}, err
 	}
-	result := apiResponse{Status: response.StatusCode, Raw: string(rawBytes)}
+	result := apiResponse{
+		Status:   response.StatusCode,
+		Raw:      string(rawBytes),
+		Replayed: response.Header.Get(httpapi.IdempotencyReplayedHeader) == "true",
+	}
 	if len(bytes.TrimSpace(rawBytes)) > 0 {
 		if err := json.Unmarshal(rawBytes, &result.Body); err != nil {
 			return apiResponse{}, fmt.Errorf("decode %s %s response: %w", method, path, err)
 		}
 	}
 	return result, nil
+}
+
+// idempotent sends a marshaled body with an Idempotency-Key header.
+func (h *harness) idempotent(method, path, key string, body any) (apiResponse, error) {
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		return apiResponse{}, err
+	}
+	return h.requestWith(method, path, encoded, map[string]string{
+		httpapi.IdempotencyKeyHeader: key,
+	})
 }
 
 func (h *harness) createDevice(tag string) (string, error) {
@@ -568,16 +970,21 @@ func hasEvent(root map[string]any, kind string) bool {
 	if err != nil {
 		return false
 	}
+	return countEvents(items, kind) > 0
+}
+
+func countEvents(items []any, kind string) int {
+	count := 0
 	for _, item := range items {
 		event, ok := item.(map[string]any)
 		if !ok {
 			continue
 		}
 		if event["kind"] == kind {
-			return true
+			count++
 		}
 	}
-	return false
+	return count
 }
 
 func nestedValue(root map[string]any, path ...string) (any, error) {

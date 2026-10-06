@@ -2,6 +2,9 @@ package assurance
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -9,6 +12,11 @@ import (
 	"example.com/solo-0021-metrology-assurance-suite/internal/contracts"
 	"example.com/solo-0021-metrology-assurance-suite/internal/domain"
 	"example.com/solo-0021-metrology-assurance-suite/internal/repository"
+)
+
+const (
+	statusCreated = 201
+	statusOK      = 200
 )
 
 type Service struct {
@@ -23,12 +31,115 @@ func NewService(repo *repository.Repository) *Service {
 	}
 }
 
-func (s *Service) RegisterDevice(ctx context.Context, input contracts.RegisterDeviceRequest) (domain.Device, error) {
-	var created domain.Device
-	tag := domain.NormalizeAssetTag(input.AssetTag)
+// RetryIdentity carries the stable retry identifier a caller attaches to one
+// business submission. Key is the caller-supplied idempotency key. Scope binds
+// the key to one write route (method plus routed path, including path values).
+// Fingerprint is a stable hash of the submitted content, used to reject a key
+// that is accidentally reused for a different request.
+type RetryIdentity struct {
+	Scope       string
+	Key         string
+	Fingerprint string
+}
+
+// Present reports whether the caller attached a stable retry identifier.
+func (r RetryIdentity) Present() bool {
+	return r.Scope != "" && r.Key != ""
+}
+
+// Submission is the result of running one write through the service. When a
+// retry identifier resolves to the first successful submission, Replayed is
+// true and Status/Payload reproduce that first, already readable result.
+type Submission[T any] struct {
+	Value    T
+	Status   int
+	Replayed bool
+}
+
+// submit runs one business action inside a single repository transaction. When
+// the retry identity is absent it preserves the original, non-idempotent
+// semantics. With a retry identity it:
+//   - replays the stored result when the same key and content is seen again;
+//   - returns ErrIdempotencyConflict when the same key is reused with content
+//     that has a different fingerprint;
+//   - stores the result together with the business changes only after the
+//     action succeeds, so an action that fails before taking effect is never
+//     remembered as a success.
+//
+// The repository mutation lock serializes concurrent retries, ensuring the
+// stored record and the business fact are created by exactly one winner.
+func submit[T any](
+	s *Service,
+	ctx context.Context,
+	retry RetryIdentity,
+	status int,
+	act func(m *repository.Mutation) (T, error),
+) (Submission[T], error) {
+	var outcome Submission[T]
 	err := s.repository.Mutate(ctx, func(m *repository.Mutation) error {
+		if retry.Present() {
+			if prior, exists := m.IdempotencyRecord(retry.Scope, retry.Key); exists {
+				if prior.Fingerprint != retry.Fingerprint {
+					return fmt.Errorf(
+						"%w: key %s was already used with different request content",
+						domain.ErrIdempotencyConflict, retry.Key,
+					)
+				}
+				if err := json.Unmarshal(prior.Response, &outcome.Value); err != nil {
+					return fmt.Errorf("replay stored response for key %s: %w", retry.Key, err)
+				}
+				outcome.Status = prior.StatusCode
+				outcome.Replayed = true
+				return nil
+			}
+		}
+
+		value, err := act(m)
+		if err != nil {
+			return err
+		}
+
+		if retry.Present() {
+			payload, err := json.Marshal(value)
+			if err != nil {
+				return fmt.Errorf("encode idempotent response for key %s: %w", retry.Key, err)
+			}
+			record := repository.IdempotencyRecord{
+				Scope:       retry.Scope,
+				Key:         retry.Key,
+				Fingerprint: retry.Fingerprint,
+				StatusCode:  status,
+				Response:    payload,
+			}
+			if err := m.PutIdempotencyRecord(record); err != nil {
+				return err
+			}
+		}
+
+		outcome.Value = value
+		outcome.Status = status
+		return nil
+	})
+	return outcome, err
+}
+
+// FingerprintRequest produces a stable hash of a decoded request body so that
+// retries carrying the same logical content match regardless of JSON field
+// order or whitespace, while genuinely different content is rejected.
+func FingerprintRequest(input any) (string, error) {
+	canonical, err := json.Marshal(input)
+	if err != nil {
+		return "", fmt.Errorf("%w: cannot derive request fingerprint", domain.ErrInvalidInput)
+	}
+	sum := sha256.Sum256(canonical)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func (s *Service) RegisterDevice(ctx context.Context, input contracts.RegisterDeviceRequest, retry RetryIdentity) (Submission[domain.Device], error) {
+	return submit(s, ctx, retry, statusCreated, func(m *repository.Mutation) (domain.Device, error) {
+		tag := domain.NormalizeAssetTag(input.AssetTag)
 		if _, exists := m.DeviceByTag(tag); exists {
-			return fmt.Errorf("%w: %s", domain.ErrDuplicateAssetTag, tag)
+			return domain.Device{}, fmt.Errorf("%w: %s", domain.ErrDuplicateAssetTag, tag)
 		}
 		item, err := domain.NewDevice(
 			m.NextID("device"),
@@ -39,10 +150,10 @@ func (s *Service) RegisterDevice(ctx context.Context, input contracts.RegisterDe
 			s.now(),
 		)
 		if err != nil {
-			return err
+			return domain.Device{}, err
 		}
 		if err := m.PutDevice(item); err != nil {
-			return err
+			return domain.Device{}, err
 		}
 		event, err := domain.NewAuditEvent(
 			m.NextID("event"),
@@ -55,13 +166,11 @@ func (s *Service) RegisterDevice(ctx context.Context, input contracts.RegisterDe
 			s.now(),
 		)
 		if err != nil {
-			return err
+			return domain.Device{}, err
 		}
 		m.AppendEvent(event)
-		created = item
-		return nil
+		return item, nil
 	})
-	return created, err
 }
 
 func (s *Service) Device(ctx context.Context, id string) (domain.Device, error) {
@@ -77,19 +186,18 @@ func (s *Service) Device(ctx context.Context, id string) (domain.Device, error) 
 	return found, err
 }
 
-func (s *Service) OpenCase(ctx context.Context, input contracts.OpenCaseRequest) (contracts.CaseResponse, error) {
-	var result contracts.CaseResponse
-	err := s.repository.Mutate(ctx, func(m *repository.Mutation) error {
+func (s *Service) OpenCase(ctx context.Context, input contracts.OpenCaseRequest, retry RetryIdentity) (Submission[contracts.CaseResponse], error) {
+	return submit(s, ctx, retry, statusCreated, func(m *repository.Mutation) (contracts.CaseResponse, error) {
 		deviceID := strings.TrimSpace(input.DeviceID)
 		device, exists := m.Device(deviceID)
 		if !exists {
-			return fmt.Errorf("%w: device %s", domain.ErrNotFound, deviceID)
+			return contracts.CaseResponse{}, fmt.Errorf("%w: device %s", domain.ErrNotFound, deviceID)
 		}
 		if !device.IsActive() {
-			return fmt.Errorf("%w: device %s is %s", domain.ErrStateConflict, device.ID, device.Status)
+			return contracts.CaseResponse{}, fmt.Errorf("%w: device %s is %s", domain.ErrStateConflict, device.ID, device.Status)
 		}
 		if active, exists := m.ActiveCaseForDevice(device.ID); exists {
-			return fmt.Errorf("%w: case %s is still %s", domain.ErrActiveCaseExists, active.ID, active.State)
+			return contracts.CaseResponse{}, fmt.Errorf("%w: case %s is still %s", domain.ErrActiveCaseExists, active.ID, active.State)
 		}
 		item, err := domain.NewVerificationCase(
 			m.NextID("case"),
@@ -100,10 +208,10 @@ func (s *Service) OpenCase(ctx context.Context, input contracts.OpenCaseRequest)
 			s.now(),
 		)
 		if err != nil {
-			return err
+			return contracts.CaseResponse{}, err
 		}
 		if err := m.PutCase(item); err != nil {
-			return err
+			return contracts.CaseResponse{}, err
 		}
 		event, err := domain.NewAuditEvent(
 			m.NextID("event"),
@@ -116,13 +224,11 @@ func (s *Service) OpenCase(ctx context.Context, input contracts.OpenCaseRequest)
 			s.now(),
 		)
 		if err != nil {
-			return err
+			return contracts.CaseResponse{}, err
 		}
 		m.AppendEvent(event)
-		result = caseResponse(m, item)
-		return nil
+		return caseResponse(m, item), nil
 	})
-	return result, err
 }
 
 func (s *Service) Case(ctx context.Context, id string) (contracts.CaseResponse, error) {
@@ -138,13 +244,12 @@ func (s *Service) Case(ctx context.Context, id string) (contracts.CaseResponse, 
 	return result, err
 }
 
-func (s *Service) RecordMeasurement(ctx context.Context, caseID string, input contracts.RecordMeasurementRequest) (contracts.CaseResponse, error) {
-	var result contracts.CaseResponse
-	err := s.repository.Mutate(ctx, func(m *repository.Mutation) error {
+func (s *Service) RecordMeasurement(ctx context.Context, caseID string, input contracts.RecordMeasurementRequest, retry RetryIdentity) (Submission[contracts.CaseResponse], error) {
+	return submit(s, ctx, retry, statusCreated, func(m *repository.Mutation) (contracts.CaseResponse, error) {
 		id := strings.TrimSpace(caseID)
 		item, exists := m.Case(id)
 		if !exists {
-			return fmt.Errorf("%w: case %s", domain.ErrNotFound, id)
+			return contracts.CaseResponse{}, fmt.Errorf("%w: case %s", domain.ErrNotFound, id)
 		}
 		measurement, err := domain.NewMeasurement(
 			m.NextID("measurement"),
@@ -156,16 +261,16 @@ func (s *Service) RecordMeasurement(ctx context.Context, caseID string, input co
 			s.now(),
 		)
 		if err != nil {
-			return err
+			return contracts.CaseResponse{}, err
 		}
 		if err := item.RecordMeasurement(measurement.Accepted, s.now()); err != nil {
-			return err
+			return contracts.CaseResponse{}, err
 		}
 		if err := m.AppendMeasurement(measurement); err != nil {
-			return err
+			return contracts.CaseResponse{}, err
 		}
 		if err := m.UpdateCase(item); err != nil {
-			return err
+			return contracts.CaseResponse{}, err
 		}
 		kind := "measurement_rejected"
 		detail := "measurement exceeded tolerance and requires another measurement"
@@ -184,33 +289,30 @@ func (s *Service) RecordMeasurement(ctx context.Context, caseID string, input co
 			s.now(),
 		)
 		if err != nil {
-			return err
+			return contracts.CaseResponse{}, err
 		}
 		m.AppendEvent(event)
-		result = caseResponse(m, item)
-		return nil
+		return caseResponse(m, item), nil
 	})
-	return result, err
 }
 
-func (s *Service) ReopenCase(ctx context.Context, caseID string, input contracts.ReopenCaseRequest) (contracts.CaseResponse, error) {
-	var result contracts.CaseResponse
-	err := s.repository.Mutate(ctx, func(m *repository.Mutation) error {
+func (s *Service) ReopenCase(ctx context.Context, caseID string, input contracts.ReopenCaseRequest, retry RetryIdentity) (Submission[contracts.CaseResponse], error) {
+	return submit(s, ctx, retry, statusOK, func(m *repository.Mutation) (contracts.CaseResponse, error) {
 		id := strings.TrimSpace(caseID)
 		item, exists := m.Case(id)
 		if !exists {
-			return fmt.Errorf("%w: case %s", domain.ErrNotFound, id)
+			return contracts.CaseResponse{}, fmt.Errorf("%w: case %s", domain.ErrNotFound, id)
 		}
 		if err := item.Reopen(s.now()); err != nil {
-			return err
+			return contracts.CaseResponse{}, err
 		}
 		if err := m.UpdateCase(item); err != nil {
-			return err
+			return contracts.CaseResponse{}, err
 		}
 		actor := strings.TrimSpace(input.Actor)
 		reason := strings.TrimSpace(input.Reason)
 		if actor == "" || reason == "" {
-			return fmt.Errorf("%w: actor and reason are required", domain.ErrInvalidInput)
+			return contracts.CaseResponse{}, fmt.Errorf("%w: actor and reason are required", domain.ErrInvalidInput)
 		}
 		event, err := domain.NewAuditEvent(
 			m.NextID("event"),
@@ -223,32 +325,29 @@ func (s *Service) ReopenCase(ctx context.Context, caseID string, input contracts
 			s.now(),
 		)
 		if err != nil {
-			return err
+			return contracts.CaseResponse{}, err
 		}
 		m.AppendEvent(event)
-		result = caseResponse(m, item)
-		return nil
+		return caseResponse(m, item), nil
 	})
-	return result, err
 }
 
-func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.SealCaseRequest) (contracts.CaseResponse, error) {
-	var result contracts.CaseResponse
-	err := s.repository.Mutate(ctx, func(m *repository.Mutation) error {
+func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.SealCaseRequest, retry RetryIdentity) (Submission[contracts.CaseResponse], error) {
+	return submit(s, ctx, retry, statusCreated, func(m *repository.Mutation) (contracts.CaseResponse, error) {
 		id := strings.TrimSpace(caseID)
 		item, exists := m.Case(id)
 		if !exists {
-			return fmt.Errorf("%w: case %s", domain.ErrNotFound, id)
+			return contracts.CaseResponse{}, fmt.Errorf("%w: case %s", domain.ErrNotFound, id)
 		}
 		if _, exists := m.Seal(item.ID); exists {
-			return fmt.Errorf("%w: case %s", domain.ErrSealAlreadyCreated, item.ID)
+			return contracts.CaseResponse{}, fmt.Errorf("%w: case %s", domain.ErrSealAlreadyCreated, item.ID)
 		}
 		measurement, ok := bestAcceptedMeasurement(m.Measurements(item.ID))
 		if !ok {
-			return fmt.Errorf("%w: an accepted measurement is required before sealing", domain.ErrStateConflict)
+			return contracts.CaseResponse{}, fmt.Errorf("%w: an accepted measurement is required before sealing", domain.ErrStateConflict)
 		}
 		if err := item.Seal(s.now()); err != nil {
-			return err
+			return contracts.CaseResponse{}, err
 		}
 		seal, err := domain.NewEvidenceSeal(
 			m.NextID("seal"),
@@ -260,13 +359,13 @@ func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.S
 			s.now(),
 		)
 		if err != nil {
-			return err
+			return contracts.CaseResponse{}, err
 		}
 		if err := m.PutSeal(seal); err != nil {
-			return err
+			return contracts.CaseResponse{}, err
 		}
 		if err := m.UpdateCase(item); err != nil {
-			return err
+			return contracts.CaseResponse{}, err
 		}
 		event, err := domain.NewAuditEvent(
 			m.NextID("event"),
@@ -279,13 +378,11 @@ func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.S
 			s.now(),
 		)
 		if err != nil {
-			return err
+			return contracts.CaseResponse{}, err
 		}
 		m.AppendEvent(event)
-		result = caseResponse(m, item)
-		return nil
+		return caseResponse(m, item), nil
 	})
-	return result, err
 }
 
 func bestAcceptedMeasurement(items []domain.Measurement) (domain.Measurement, bool) {

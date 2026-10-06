@@ -15,6 +15,7 @@ type Repository struct {
 	measurements map[string][]domain.Measurement
 	seals        map[string]domain.EvidenceSeal
 	events       []domain.AuditEvent
+	submissions  map[string]IdempotencyRecord
 	counters     map[string]int
 }
 
@@ -24,8 +25,28 @@ func New() *Repository {
 		cases:        make(map[string]domain.VerificationCase),
 		measurements: make(map[string][]domain.Measurement),
 		seals:        make(map[string]domain.EvidenceSeal),
+		submissions:  make(map[string]IdempotencyRecord),
 		counters:     make(map[string]int),
 	}
+}
+
+// IdempotencyRecord stores the first successful business submission keyed by a
+// stable retry identifier within one request scope. It is committed atomically
+// with the business mutation, so a failed attempt never leaves a remembered
+// result and concurrent retries can resolve to exactly one business fact.
+type IdempotencyRecord struct {
+	Scope       string
+	Key         string
+	Fingerprint string
+	StatusCode  int
+	Response    []byte
+}
+
+// IdempotencyKey builds the storage key for a retry identifier within a scope.
+// The scope is the HTTP method plus the routed path (including path values),
+// which keeps identifiers for different business actions isolated.
+func IdempotencyKey(scope, key string) string {
+	return scope + "\x00" + key
 }
 
 type Snapshot struct {
@@ -96,6 +117,7 @@ type Mutation struct {
 	measurements map[string][]domain.Measurement
 	seals        map[string]domain.EvidenceSeal
 	events       []domain.AuditEvent
+	submissions  map[string]IdempotencyRecord
 	counters     map[string]int
 }
 
@@ -193,6 +215,23 @@ func (m *Mutation) AppendEvent(item domain.AuditEvent) {
 	m.events = append(m.events, item)
 }
 
+func (m *Mutation) IdempotencyRecord(scope, key string) (IdempotencyRecord, bool) {
+	item, ok := m.submissions[IdempotencyKey(scope, key)]
+	return item, ok
+}
+
+// PutIdempotencyRecord remembers the first successful submission for a retry
+// identifier. It rejects a second write for the same key so that only one
+// business fact can be recorded within the serialized mutation.
+func (m *Mutation) PutIdempotencyRecord(item IdempotencyRecord) error {
+	storageKey := IdempotencyKey(item.Scope, item.Key)
+	if _, exists := m.submissions[storageKey]; exists {
+		return fmt.Errorf("%w: key %s in scope %s", domain.ErrIdempotencyConflict, item.Key, item.Scope)
+	}
+	m.submissions[storageKey] = item
+	return nil
+}
+
 func (m *Mutation) Events(caseID string) []domain.AuditEvent {
 	var result []domain.AuditEvent
 	for _, item := range m.events {
@@ -225,6 +264,7 @@ func (r *Repository) Mutate(ctx context.Context, fn func(*Mutation) error) error
 		measurements: cloneMeasurements(r.measurements),
 		seals:        cloneSeals(r.seals),
 		events:       append([]domain.AuditEvent(nil), r.events...),
+		submissions:  cloneSubmissions(r.submissions),
 		counters:     cloneCounters(r.counters),
 	}
 	if err := fn(next); err != nil {
@@ -235,6 +275,7 @@ func (r *Repository) Mutate(ctx context.Context, fn func(*Mutation) error) error
 	r.measurements = next.measurements
 	r.seals = next.seals
 	r.events = next.events
+	r.submissions = next.submissions
 	r.counters = next.counters
 	return nil
 }
@@ -284,6 +325,15 @@ func cloneSeals(values map[string]domain.EvidenceSeal) map[string]domain.Evidenc
 func cloneCounters(values map[string]int) map[string]int {
 	result := make(map[string]int, len(values))
 	for key, value := range values {
+		result[key] = value
+	}
+	return result
+}
+
+func cloneSubmissions(values map[string]IdempotencyRecord) map[string]IdempotencyRecord {
+	result := make(map[string]IdempotencyRecord, len(values))
+	for key, value := range values {
+		value.Response = append([]byte(nil), value.Response...)
 		result[key] = value
 	}
 	return result
